@@ -11,17 +11,19 @@ def add (a, b)
 return a + b
 end
 
-print add(10, 2)
+print add (10, 2)
 run
 
 
+var counter = 100
 var a = 0
 var b = 1
-while (true)
+while (counter != 0)
     var c = a + b
     print b
     var a = b
     var b = c
+    var counter = counter - 1 
 end
 run
 
@@ -30,6 +32,7 @@ run
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <sstream>
 #include <cctype>
 #include <algorithm>
@@ -81,6 +84,8 @@ vector<ROSdatatype> ReturnValueStack;
 
 unordered_map<string, functionData> functions;
 
+vector<unordered_set<string>> GlobalMarkStack; // per-function set of names marked global
+
 const vector<vector<string>> precedence = {
     {"index"},
     {"++", "--"},
@@ -99,9 +104,9 @@ const vector<string> binaryOP {
 const vector<string> unaryOP_prefix { "not" };
 const vector<string> unaryOP_suffix { "++", "--" };
 
-void error(const string& msg) { 
+void error(const string& msg) {
     cerr << "Error: " << msg << " at line " << lineIndex << endl;
-    hasErrored = true; 
+    hasErrored = true;
 }
 
 bool isNumber(const string& s) {
@@ -151,6 +156,9 @@ vector<string> tokenize(const string& str) {
                 current += c;
             } else if (isspace(static_cast<unsigned char>(c))) {
                 if (!current.empty()) { tokens.push_back(current); current.clear(); }
+            } else if (c == '(' || c == ')' || c == ',') {
+                if (!current.empty()) { tokens.push_back(current); current.clear(); }
+                tokens.push_back(string(1, c));
             } else {
                 current += c;
             }
@@ -243,14 +251,15 @@ ROSdatatype parseValue(const string& valueStr) {
     ROSdatatype r;
     string s = valueStr;
     if (isNumber(s)) { r.floatValue = stof(s); r.type = "float"; }
-
     else if ((s.size() >= 2) && ((s.front() == '\'' && s.back() == '\'') || (s.front() == '"' && s.back() == '"'))) {
         r.stringValue = s.substr(1, s.size() - 2); r.type = "string";
-    } 
+    }
     else if (s == "true" || s == "false") { r.type = "bool"; r.boolValue = (s == "true"); }
-    
-    else { ROSdatatype got; if (lookupVar(s, got)) r = got; else error("cannot parse value: " + s); }
-    
+    else {
+        ROSdatatype got;
+        if (lookupVar(s, got)) r = got;
+        else { error("cannot parse value: " + s); }
+    }
     return r;
 }
 
@@ -260,21 +269,14 @@ vector<string> tokenizeExpression(const string& str) {
     bool inQuote = false;
     char quoteChar = '\0';
 
-    // collect all operators dynamically
     vector<string> allOps;
     for (auto &group : precedence) for (auto &op : group) allOps.push_back(op);
     for (auto &op : unaryOP_prefix) allOps.push_back(op);
     for (auto &op : unaryOP_suffix) allOps.push_back(op);
     for (auto &op : binaryOP) allOps.push_back(op);
-
-    // dedupe
     sort(allOps.begin(), allOps.end());
     allOps.erase(unique(allOps.begin(), allOps.end()), allOps.end());
-
-    // longest first
-    sort(allOps.begin(), allOps.end(), [](const string& a, const string& b){
-        return a.size() > b.size();
-    });
+    sort(allOps.begin(), allOps.end(), [](const string& a, const string& b){ return a.size() > b.size(); });
 
     auto flushCurrent = [&]() {
         if (!current.empty()) { tokens.push_back(current); current.clear(); }
@@ -332,6 +334,10 @@ vector<string> tokenizeExpression(const string& str) {
     return tokens;
 }
 
+static int __expr_placeholder_counter = 0;
+
+ROSdatatype callFunction(const string& fname, const vector<string>& argExprs);
+
 ROSdatatype binaryMath(const string& a, const string& op, const string& b) {
     ROSdatatype Adata = parseValue(a);
     ROSdatatype Bdata = parseValue(b);
@@ -343,11 +349,11 @@ ROSdatatype binaryMath(const string& a, const string& op, const string& b) {
         else if (op == "-") result.floatValue = Adata.floatValue - Bdata.floatValue;
         else if (op == "*") result.floatValue = Adata.floatValue * Bdata.floatValue;
         else if (op == "/") {
-            if (Bdata.floatValue == 0) { error("Division by zero"); return result; }
+            if (Bdata.floatValue == 0) { error("Division by zero"); std::exit(1); }
             result.floatValue = Adata.floatValue / Bdata.floatValue;
         }
         else if (op == "//") {
-            if (Bdata.floatValue == 0) { error("Division by zero"); return result; }
+            if (Bdata.floatValue == 0) { error("Division by zero"); std::exit(1); }
             result.floatValue = static_cast<int>(Adata.floatValue / Bdata.floatValue);
         }
         else if (op == "==") { result.type = "bool"; result.boolValue = (Adata.floatValue == Bdata.floatValue); }
@@ -410,10 +416,19 @@ ROSdatatype unaryMath(const string& a, const string& op) {
     }
     return result;
 }
+
 ROSdatatype expression(const string& expr) {
     vector<string> tokens = tokenizeExpression(expr);
     if (tokens.empty()) { error("Empty expression"); return ROSdatatype(); }
+    vector<string> placeholdersToErase;
 
+    auto makePlaceholder = [&]() {
+        string name = "__EXPR_PLACEHOLDER__" + to_string(__expr_placeholder_counter++);
+        placeholdersToErase.push_back(name);
+        return name;
+    };
+
+    // resolve parentheses and function calls
     for (int i = 0; i < (int)tokens.size(); i++) {
         if (tokens[i] == "(") {
             int depth = 1;
@@ -432,14 +447,51 @@ ROSdatatype expression(const string& expr) {
                 innerExpr += inner[k];
             }
 
-            ROSdatatype value = expression(innerExpr);
-            tokens.erase(tokens.begin() + i, tokens.begin() + j);
-            currentScope()["__EXPR_PLACEHOLDER__"] = value;
-            tokens.insert(tokens.begin() + i, "__EXPR_PLACEHOLDER__");
-            i--;
+            // function call if previous token exists and is a function name
+            if (i - 1 >= 0 && functions.count(tokens[i - 1])) {
+                string fname = tokens[i - 1];
+
+                // enforce mandatory space before '('
+                if (expr.find(fname + "(") != string::npos) {
+                    error("function calls require a space before '('");
+                    return ROSdatatype();
+                }
+
+                // parse arguments from innerExpr
+                vector<string> args;
+                string cur;
+                int d = 0;
+                for (char c : innerExpr) {
+                    if (c == '(') d++;
+                    else if (c == ')') d--;
+                    if (c == ',' && d == 0) { args.push_back(strip(cur)); cur.clear(); }
+                    else cur += c;
+                }
+                if (!cur.empty()) args.push_back(strip(cur));
+
+                // evaluate call
+                ROSdatatype callVal = callFunction(fname, args);
+
+                string ph = makePlaceholder();
+                currentScope()[ph] = callVal;
+
+                // replace fname, '(', inner..., ')' with placeholder
+                tokens.erase(tokens.begin() + (i - 1), tokens.begin() + j);
+                tokens.insert(tokens.begin() + (i - 1), ph);
+                i -= 1;
+            } else {
+                // normal parenthesized subexpression
+                ROSdatatype value = expression(innerExpr);
+                string ph = makePlaceholder();
+                currentScope()[ph] = value;
+                tokens.erase(tokens.begin() + i, tokens.begin() + j);
+                tokens.insert(tokens.begin() + i, ph);
+                i--;
+            }
         }
     }
 
+    // apply operators by precedence
     for (const vector<string>& pass : precedence) {
         for (int i = 0; i < (int)tokens.size(); i++) {
             string token = tokens[i];
@@ -448,8 +500,9 @@ ROSdatatype expression(const string& expr) {
             if (contains(unaryOP_prefix, token)) {
                 if (i + 1 >= (int)tokens.size()) { error("Missing operand for " + token); return ROSdatatype(); }
                 ROSdatatype value = unaryMath(tokens[i + 1], token);
-                currentScope()["__EXPR_PLACEHOLDER__"] = value;
-                tokens[i] = "__EXPR_PLACEHOLDER__";
+                string ph = makePlaceholder();
+                currentScope()[ph] = value;
+                tokens[i] = ph;
                 tokens.erase(tokens.begin() + (i + 1));
                 i--;
                 continue;
@@ -458,8 +511,9 @@ ROSdatatype expression(const string& expr) {
             if (contains(unaryOP_suffix, token)) {
                 if (i == 0) { error("Missing operand for " + token); return ROSdatatype(); }
                 ROSdatatype value = unaryMath(tokens[i - 1], token);
-                currentScope()["__EXPR_PLACEHOLDER__"] = value;
-                tokens[i] = "__EXPR_PLACEHOLDER__";
+                string ph = makePlaceholder();
+                currentScope()[ph] = value;
+                tokens[i] = ph;
                 tokens.erase(tokens.begin() + (i - 1));
                 i--;
                 continue;
@@ -468,8 +522,9 @@ ROSdatatype expression(const string& expr) {
             if (contains(binaryOP, token)) {
                 if (i == 0 || i + 1 >= (int)tokens.size()) { error("Missing operand for " + token); return ROSdatatype(); }
                 ROSdatatype value = binaryMath(tokens[i - 1], token, tokens[i + 1]);
-                currentScope()["__EXPR_PLACEHOLDER__"] = value;
-                tokens[i] = "__EXPR_PLACEHOLDER__";
+                string ph = makePlaceholder();
+                currentScope()[ph] = value;
+                tokens[i] = ph;
                 tokens.erase(tokens.begin() + (i + 1));
                 tokens.erase(tokens.begin() + (i - 1));
                 i--;
@@ -479,13 +534,77 @@ ROSdatatype expression(const string& expr) {
     }
 
     ROSdatatype result;
-    if (!tokens.empty() && tokens[0] == "__EXPR_PLACEHOLDER__") result = currentScope()["__EXPR_PLACEHOLDER__"];
+    if (!tokens.empty() && tokens[0].find("__EXPR_PLACEHOLDER__") == 0) result = currentScope()[tokens[0]];
     else result = parseValue(tokens[0]);
+
+    // cleanup placeholders
+    for (const auto& name : placeholdersToErase) {
+        auto& scope = currentScope();
+        auto it = scope.find(name);
+        if (it != scope.end()) scope.erase(it);
+        auto itg = variables.find(name);
+        if (itg != variables.end()) variables.erase(itg);
+    }
+
     return result;
 }
 
-// --- execBlock with function calling ---
+ROSdatatype callFunction(const string& fname, const vector<string>& argExprs) {
+    // push new local scope
+    LocalScopeStack.push_back(unordered_map<string, ROSdatatype>());
+    GlobalMarkStack.push_back(unordered_set<string>());
+    InFunctionDepth++;
+    ReturnFlagStack.push_back(false);
+
+    functionData func = functions[fname];
+
+    for (int i = 0; i < func.numArgs; i++) {
+        if (i < (int)argExprs.size()) {
+            currentScope()[func.argNames[i]] = expression(argExprs[i]);
+        } else {
+            ROSdatatype def; def.type = "float"; def.floatValue = 0.0f;
+            currentScope()[func.argNames[i]] = def;
+        }
+    }
+
+    int savedLine = lineIndex;
+    lineIndex = 0;
+    // execute function body
+    bool savedError = hasErrored;
+    hasErrored = false;
+    // Reuse execBlock to execute function body
+    // forward declaration
+    void execBlock(const vector<string>&);
+    execBlock(func.body);
+
+    ROSdatatype retVal;
+    if (!ReturnValueStack.empty()) {
+        retVal = ReturnValueStack.back();
+        ReturnValueStack.pop_back();
+    } else {
+        retVal.type = "float";
+        retVal.floatValue = 0.0f;
+    }
+    if (!ReturnFlagStack.empty()) ReturnFlagStack.pop_back();
+
+    LocalScopeStack.pop_back();
+    GlobalMarkStack.pop_back();
+    InFunctionDepth--;
+    lineIndex = savedLine;
+    hasErrored = savedError || hasErrored;
+    return retVal;
+}
+
+bool truthy(const ROSdatatype& v) {
+    if (v.type == "bool") return v.boolValue;
+    if (v.type == "float") return v.floatValue != 0.0f;
+    if (v.type == "string") return !v.stringValue.empty();
+    if (v.type == "list") return !v.listValue.empty();
+    return false;
+}
+
 void execBlock(const vector<string>& block) {
+    int savedLineIndex = lineIndex;
     lineIndex = 0;
     while (lineIndex < (int)block.size()) {
         string line = block[lineIndex];
@@ -502,9 +621,20 @@ void execBlock(const vector<string>& block) {
             if (tokens.size() < 4 || tokens[2] != "=") { error("invalid var syntax"); lineIndex++; continue; }
             size_t eqpos = line.find('=');
             if (eqpos == string::npos) { error("missing = in var"); lineIndex++; continue; }
-            string expr = strip(sliceStr(line, eqpos + 1));
-            currentScope()[tokens[1]] = expression(expr);
-            auto& scope = currentScope();
+            string name = tokens[1];
+            string exprStr = strip(sliceStr(line, eqpos + 1));
+            ROSdatatype val = expression(exprStr);
+
+            if (InFunctionDepth > 0 && !GlobalMarkStack.empty() && GlobalMarkStack.back().count(name)) {
+                variables[name] = val;
+            } else {
+                currentScope()[name] = val;
+            }
+        }
+        else if (cmd == "global") {
+            if (InFunctionDepth == 0) { lineIndex++; continue; }
+            if (tokens.size() < 2) { error("global requires a name"); lineIndex++; continue; }
+            GlobalMarkStack.back().insert(tokens[1]);
         }
         else if (cmd == "def") {
             if (tokens.size() < 2) { error("function name missing"); lineIndex++; continue; }
@@ -532,15 +662,19 @@ void execBlock(const vector<string>& block) {
 
             functionData func;
             func.argNames = params;
-            func.numArgs = params.size();
+            func.numArgs = (int)params.size();
             func.body = fb;
 
             functions[fname] = func;
             continue;
         }
         else if (functions.count(cmd)) {
-            // function call
-            string fname = cmd;
+            // standalone function call (no assignment)
+            // enforce mandatory space before '('
+            if (line.find(cmd + "(") != string::npos) {
+                error("function calls require a space before '('");
+                return;
+            }
             size_t lp = line.find("("), rp = line.find(")");
             vector<string> args;
             if (lp != string::npos && rp != string::npos && rp > lp) {
@@ -555,45 +689,133 @@ void execBlock(const vector<string>& block) {
                 if (!cur.empty()) args.push_back(strip(cur));
             }
 
-            // push new local scope
-            LocalScopeStack.push_back(unordered_map<string, ROSdatatype>());
-            InFunctionDepth++;
-            ReturnFlagStack.push_back(false);
-
-            functionData& func = functions[fname];
-            functionData funcCopy = func; // copy to avoid mutation
-
-            // map args to params
-            size_t n = min((int)args.size(), func.numArgs); // number of args <= params
-            for (int i=0; i!=func.numArgs; i++) {
-                currentScope()[func.argNames[i]] = expression(args[i]);
-            }
-            int currentI  = lineIndex;
-            execBlock(func.body);
-            lineIndex = currentI;
-
-            ROSdatatype retVal;
-            if (!ReturnValueStack.empty()) retVal = ReturnValueStack.back();
-            if (!ReturnFlagStack.empty()) ReturnFlagStack.pop_back();
-            if (!ReturnValueStack.empty()) ReturnValueStack.pop_back();
-            LocalScopeStack.pop_back();
-            InFunctionDepth--;
-
+            (void)callFunction(cmd, args);
             lineIndex++;
             continue;
         }
         else if (cmd == "return") {
-            string expr = sliceStr(line, line.find("return") + 6);
-            ReturnValueStack.push_back(expression(strip(expr)));
+            string exprStr = sliceStr(line, line.find("return") + 6);
+            ReturnValueStack.push_back(expression(strip(exprStr)));
             if (!ReturnFlagStack.empty()) ReturnFlagStack.back() = true;
             return;
         }
+        else if (cmd == "while") {
+            size_t lp = line.find("("), rp = line.find_last_of(')');
+            if (lp == string::npos || rp == string::npos || rp <= lp) { error("invalid while syntax"); lineIndex++; continue; }
+            string condExpr = strip(sliceStr(line, lp + 1, rp));
+
+            vector<string> body;
+            int depth = 1;
+            lineIndex++;
+            while (lineIndex < (int)block.size() && depth > 0) {
+                vector<string> t = tokenize(block[lineIndex]);
+                if (!t.empty()) {
+                    if (t[0] == "while") depth++;
+                    else if (t[0] == "end") depth--;
+                }
+                if (depth > 0) body.push_back(block[lineIndex]);
+                lineIndex++;
+            }
+
+            while (true) {
+                ROSdatatype cv = expression(condExpr);
+                if (!truthy(cast(cv, "bool"))) break;
+                execBlock(body);
+                if (hasErrored) break;
+            }
+            continue;
+        }
+        else if (cmd == "for") {
+            size_t lp = line.find("("), rp = line.find_last_of(')');
+            if (lp == string::npos || rp == string::npos || rp <= lp) { error("invalid for syntax"); lineIndex++; continue; }
+            string inside = strip(sliceStr(line, lp + 1, rp));
+
+            // split by ';' into init; cond; inc
+            vector<string> parts;
+            string cur; int depth = 0;
+            for (char c : inside) {
+                if (c == '(') depth++; else if (c == ')') depth--;
+                if (c == ';' && depth == 0) { parts.push_back(strip(cur)); cur.clear(); }
+                else cur += c;
+            }
+            if (!cur.empty()) parts.push_back(strip(cur));
+            if (parts.size() != 3) { error("for requires 3 parts"); lineIndex++; continue; }
+            string init = parts[0], cond = parts[1], inc = parts[2];
+
+            // execute init (support "i = x" or "var i = x")
+            auto doAssign = [&](const string& s) {
+                string lhs, rhs; size_t eq = s.find('=');
+                if (eq != string::npos) {
+                    lhs = strip(sliceStr(s, 0, eq));
+                    rhs = strip(sliceStr(s, eq + 1));
+                    currentScope()[lhs] = expression(rhs);
+                } else {
+                    // allow "i + 1" style increment in init too (rare)
+                    vector<string> ts = tokenize(s);
+                    if (ts.size() == 3 && ts[1] == "+") {
+                        ROSdatatype curv = parseValue(ts[0]);
+                        ROSdatatype addv = expression(ts[2]);
+                        ROSdatatype sum = binaryMath(ts[0], "+", ts[2]);
+                        currentScope()[ts[0]] = sum;
+                    }
+                }
+            };
+            if (init.rfind("var ", 0) == 0) {
+                string rest = strip(sliceStr(init, 4));
+                doAssign(rest);
+            } else {
+                doAssign(init);
+            }
+
+            // capture body
+            vector<string> body;
+            int depth2 = 1;
+            lineIndex++;
+            while (lineIndex < (int)block.size() && depth2 > 0) {
+                vector<string> t = tokenize(block[lineIndex]);
+                if (!t.empty()) {
+                    if (t[0] == "for") depth2++;
+                    else if (t[0] == "end") depth2--;
+                }
+                if (depth2 > 0) body.push_back(block[lineIndex]);
+                lineIndex++;
+            }
+
+            auto doInc = [&]() {
+                size_t eq = inc.find('=');
+                if (eq != string::npos) {
+                    string lhs = strip(sliceStr(inc, 0, eq));
+                    string rhs = strip(sliceStr(inc, eq + 1));
+                    currentScope()[lhs] = expression(rhs);
+                } else {
+                    vector<string> ts = tokenize(inc);
+                    if (ts.size() == 3 && ts[1] == "+") {
+                        ROSdatatype sum = binaryMath(ts[0], "+", ts[2]);
+                        currentScope()[ts[0]] = sum;
+                    } else {
+                        // generic expression evaluated but result ignored
+                        (void)expression(inc);
+                    }
+                }
+            };
+
+            while (true) {
+                ROSdatatype cv = expression(cond);
+                if (!truthy(cast(cv, "bool"))) break;
+                execBlock(body);
+                if (hasErrored) break;
+                doInc();
+            }
+            continue;
+        }
         else if (cmd == "help") {
             print("ROS++ toy interpreter");
-            print("Commands: print, var, def, return, while, for, end");
+            print("Commands: print, var, def, return, while, for, global, end");
         }
+
         lineIndex++;
     }
+    lineIndex = savedLineIndex;
 }
 
 int main() {
@@ -615,8 +837,13 @@ int main() {
 
             toExec.clear();
             cout << "completed running in " << elapsed.count() << " seconds" << endl;
-        } else {
+        }
+        else if (ask == "exit") {
+            break;
+        }
+         else {
             toExec.push_back(ask);
         }
+        
     }
 }
