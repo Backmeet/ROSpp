@@ -809,8 +809,30 @@ void execBlock(const vector<string>& block) {
             continue;
         }
         else if (cmd == "help") {
-            print("ROS++ toy interpreter");
+            print("ROS++ interpreter");
             print("Commands: print, var, def, return, while, for, global, end");
+            print("var <name> = <expression>");
+            print("var x = add (10, 2) + 32 / 3  * (54 + 2)");
+            print("");
+            print("def <name> (arg1, arg2 ...)");
+            print("return <expression>");
+            print("end");
+            print("");
+            print("def add (a, b)");
+            print("return a + b");
+            print("end");
+            print("");
+            print("while (<expression>)");
+            print("end");
+            print("while (true)");
+            print("print 'yes'");
+            print("end");
+            print("");
+            print("for (<var> = <expression>; <expression>; <expression>)");
+            print("end");
+            print("for (i = 0; i != 10; i + 1)");
+            print("print i");
+            print("end");
         }
 
         lineIndex++;
