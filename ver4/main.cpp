@@ -819,7 +819,7 @@ void execBlock(const vector<string>& block) {
 }
 
 int main() {
-    cout << "Type 'help' for a list of cmds." << endl;
+    cout << "Type 'help' for a list of cmds. \nafter typeing in the program type 'run' to run the program." << endl;
     string ask;
     vector<string> toExec;
 
